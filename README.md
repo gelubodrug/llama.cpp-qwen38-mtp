@@ -1,4 +1,14 @@
-# llama.cpp
+# llama.cpp + MTP Experimental — Qwen3.8 Flash Next
+
+> Experimental Apple Silicon build of upstream [PR #28243](https://github.com/ggml-org/llama.cpp/pull/28243). The PR is still under review and this fork is not an official llama.cpp release.
+
+![Qwen3.8 Flash Next llama.cpp MTP benchmark](docs/benchmarks/qwen38-flash-next-mtp-apple-silicon.png)
+
+On the same Qwen3.8 Flash Next `UD-IQ3_XXS` GGUF and the same deterministic prompt/settings, the MTP build measured **63.8 tok/s**, versus **44.4 tok/s** without MTP — **43.7% faster** from the rounded headline results. See [the reproducible benchmark notes](QWEN38_MTP_BENCHMARK.md).
+
+---
+
+# Upstream llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
