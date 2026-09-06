@@ -1,6 +1,6 @@
-# Qwen3.8 Flash Next + MTP on Apple Silicon
+# Historical IQ3 microbenchmark - September 4, 2026
 
-This branch packages the current head of upstream llama.cpp [PR #28243](https://github.com/ggml-org/llama.cpp/pull/28243) for reproducible Apple Silicon testing. It is experimental and is not an official llama.cpp release.
+This document records an earlier test of upstream llama.cpp [PR #28243](https://github.com/ggml-org/llama.cpp/pull/28243) at `2c967293c2632bd0d09096406628a7e4baf97b88`. It does not describe the latest head of that PR or the locally patched Q4 audit published on September 6. See [the current patched-build notes](QWEN38_MTP_CACHE_FIX.md) for that separate test. This fork is experimental and is not an official llama.cpp release.
 
 ## Result
 
@@ -35,6 +35,8 @@ cmake --build build-metal --config Release -j
 ```
 
 ## Run the server with MTP
+
+This is a server launch example, not an exact replay of the microbenchmark: it uses 32768 context, while the recorded benchmark context above is 4096. The exact benchmark prompt is not included in these historical notes.
 
 ```bash
 ./build-metal/bin/llama-server \

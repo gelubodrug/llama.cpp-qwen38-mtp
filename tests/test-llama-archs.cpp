@@ -6,9 +6,11 @@
 #include "ggml-cpp.h"
 #include "llama.h"
 #include "llama-cpp.h"
+#include "speculative.h"
 
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
+#include "../src/llama-ext.h"
 #include "../src/llama-model-saver.h"
 
 #include <cinttypes>
@@ -65,7 +67,7 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 }
 
 static void usage(char ** argv) {
-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v N] [-h/--help]\n", argv[0]);
+    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [--test-mtp-shared] [-v N] [-h/--help]\n", argv[0]);
 }
 
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
@@ -436,6 +438,154 @@ static std::vector<float> get_logits(
     return ret;
 }
 
+static int test_mtp_shared(const size_t seed) {
+    auto metadata = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
+    llama_model_saver ms(LLM_ARCH_QWEN4EXP, metadata.get());
+    ms.add_kv(LLM_KV_BLOCK_COUNT, uint32_t(3));
+    ms.add_kv(LLM_KV_NEXTN_PREDICT_LAYERS, uint32_t(1));
+    ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS, std::vector<uint32_t>({4, 4, 4}));
+
+    std::vector<std::string> vocab = {"<unk>", "<s>", "</s>"};
+    for (int i = 0; i < 256; ++i) {
+        char token[7];
+        snprintf(token, sizeof(token), "<0x%02X>", i);
+        vocab.emplace_back(token);
+    }
+    ms.add_kv(LLM_KV_TOKENIZER_MODEL, "llama");
+    ms.add_kv(LLM_KV_TOKENIZER_LIST, vocab);
+    ms.add_kv(LLM_KV_VOCAB_SIZE, uint32_t(vocab.size()));
+
+    llama_model_saver draft_saver(LLM_ARCH_QWEN4EXP, nullptr);
+    gguf_set_kv(draft_saver.gguf_ctx, metadata.get());
+    gguf_remove_key(draft_saver.gguf_ctx, draft_saver.llm_kv(LLM_KV_PLE_LAYERS).c_str());
+
+    struct tensor_data {
+        size_t seed;
+        llama_model_saver * saver;
+    } data {seed, &draft_saver};
+
+    ggml_backend_dev_t devices[] = {nullptr};
+    auto mparams = llama_model_default_params();
+    mparams.devices = devices;
+    mparams.n_gpu_layers = 0;
+    mparams.use_extra_bufts = false;
+    mparams.load_mtp = true;
+    mparams.progress_callback = silent_model_load_progress;
+
+    // The virtual loader creates optional weights too. Reload only the MTP block to test weight borrowing.
+    llama_model_ptr model_tgt(llama_model_init_from_user(metadata.get(), [](ggml_tensor * tensor, void * userdata) {
+        auto * data = static_cast<tensor_data *>(userdata);
+        set_tensor_data(tensor, &data->seed);
+        if (strncmp(tensor->name, "blk.2.", 6) == 0 &&
+                strstr(tensor->name, ".nextn.embed_tokens.") == nullptr &&
+                strstr(tensor->name, ".nextn.shared_head_head.") == nullptr) {
+            data->saver->add_tensor(tensor);
+        }
+    }, &data, mparams));
+    if (!model_tgt) {
+        throw std::runtime_error("failed to create MTP target fixture");
+    }
+
+    std::unique_ptr<FILE, decltype(&fclose)> file(tmpfile(), fclose);
+    if (!file) {
+        throw std::runtime_error("failed to create MTP draft fixture file");
+    }
+    GGML_ASSERT(gguf_find_tensor(draft_saver.gguf_ctx, "token_embd.weight") < 0);
+    GGML_ASSERT(gguf_find_tensor(draft_saver.gguf_ctx, "output.weight") < 0);
+    draft_saver.save(file.get());
+    rewind(file.get());
+    llama_model_ptr model_dft(llama_model_load_from_file_ptr(file.get(), mparams));
+    if (!model_dft) {
+        throw std::runtime_error("failed to load shared MTP draft fixture");
+    }
+
+    auto cparams = llama_context_default_params();
+    cparams.n_ctx = 64;
+    cparams.n_batch = 16;
+    cparams.n_ubatch = 16;
+    cparams.n_threads = 2;
+    cparams.n_threads_batch = 2;
+    cparams.offload_kqv = false;
+    cparams.op_offload = false;
+    cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    llama_context_ptr ctx_tgt(llama_init_from_model(model_tgt.get(), cparams));
+    if (!ctx_tgt) {
+        throw std::runtime_error("failed to create MTP target context");
+    }
+    cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+    cparams.ctx_other = ctx_tgt.get();
+    llama_context_ptr ctx_dft(llama_init_from_model(model_dft.get(), cparams));
+    if (!ctx_dft) {
+        throw std::runtime_error("failed to create shared MTP draft context");
+    }
+    GGML_ASSERT(llama_get_ctx_other(ctx_dft.get()) == ctx_tgt.get());
+
+    const auto mem_tgt = llama_get_memory(ctx_tgt.get());
+    const auto mem_dft = llama_get_memory(ctx_dft.get());
+    for (int n_draft : {2, 3}) {
+        llama_memory_clear(mem_tgt, true);
+        llama_memory_clear(mem_dft, true);
+        common_params_speculative params;
+        params.types = {COMMON_SPECULATIVE_TYPE_DRAFT_MTP};
+        params.draft.ctx_tgt = ctx_tgt.get();
+        params.draft.ctx_dft = ctx_dft.get();
+        params.draft.n_max = n_draft;
+        params.draft.p_min = 0.0f;
+        params.draft.backend_sampling = false;
+        common_speculative_ptr spec(common_speculative_init(params, 1));
+        GGML_ASSERT(spec);
+
+        llama_tokens prompt = get_tokens(8, 128, seed);
+        auto process = [&](llama_tokens tokens, llama_pos pos) {
+            llama_batch batch = llama_batch_get_one(tokens.data(), (int32_t) tokens.size());
+            std::vector<llama_pos> positions(tokens.size());
+            std::vector<int32_t> n_seq_id(tokens.size(), 1);
+            llama_seq_id seq_id = 0;
+            std::vector<llama_seq_id *> seq_ids(tokens.size(), &seq_id);
+            std::vector<int8_t> logits(tokens.size(), 1);
+            for (size_t i = 0; i < tokens.size(); ++i) {
+                positions[i] = pos + (llama_pos) i;
+            }
+            batch.pos = positions.data();
+            batch.n_seq_id = n_seq_id.data();
+            batch.seq_id = seq_ids.data();
+            batch.logits = logits.data();
+            GGML_ASSERT(llama_decode(ctx_tgt.get(), batch) == 0);
+            GGML_ASSERT(common_speculative_process(spec.get(), batch));
+            GGML_ASSERT(llama_memory_seq_pos_max(mem_dft, 0) == pos + (llama_pos) tokens.size() - 1);
+        };
+        process(llama_tokens(prompt.begin(), prompt.begin() + 4), 0);
+        process(llama_tokens(prompt.begin() + 4, prompt.end()), 4);
+        common_speculative_begin(spec.get(), 0, prompt);
+
+        llama_tokens result;
+        auto & dp = common_speculative_get_draft_params(spec.get(), 0);
+        dp.n_past = (llama_pos) prompt.size();
+        dp.id_last = 42;
+        dp.prompt = &prompt;
+        dp.result = &result;
+        for (int round = 0; round < 2; ++round) {
+            const llama_pos pos_tgt = llama_memory_seq_pos_max(mem_tgt, 0);
+            result.clear();
+            dp.drafting = true;
+            common_speculative_draft(spec.get());
+            GGML_ASSERT(result.size() == (size_t) n_draft);
+            GGML_ASSERT(llama_memory_seq_pos_max(mem_dft, 0) == dp.n_past + n_draft - 1);
+            GGML_ASSERT(llama_memory_seq_pos_max(mem_tgt, 0) == pos_tgt);
+
+            GGML_ASSERT(llama_memory_seq_rm(mem_dft, 0, dp.n_past, -1));
+            process({dp.id_last, result[0]}, dp.n_past);
+            common_speculative_accept(spec.get(), 0, 1);
+            prompt.push_back(dp.id_last);
+            prompt.push_back(result[0]);
+            dp.id_last = result[1];
+            dp.n_past += 2;
+        }
+        printf("shared MTP: %d draft tokens, catch-up and rollback OK\n", n_draft);
+    }
+    return 0;
+}
+
 static bool moe_mandatory(const llm_arch arch) {
     switch (arch) {
         case LLM_ARCH_LLAMA4:
@@ -798,6 +948,7 @@ int main(int argc, char ** argv) {
     llm_arch arch = LLM_ARCH_UNKNOWN;
     size_t seed = rd();
     std::string out;
+    bool mtp_shared = false;
 
     int verbosity = LOG_LEVEL_ERROR;
 
@@ -805,6 +956,9 @@ int main(int argc, char ** argv) {
         if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv);
             return 0;
+        }
+        if (strcmp(argv[i], "--test-mtp-shared") == 0) {
+            mtp_shared = true;
         }
         if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--arch") == 0) {
             if (i + 1 < argc) {
@@ -847,6 +1001,9 @@ int main(int argc, char ** argv) {
     printf("%s: using seed %zu\n", __func__, seed);
 
     try {
+        if (mtp_shared) {
+            return test_mtp_shared(seed);
+        }
         if (!out.empty()) {
             return save_models(arch, seed, verbosity, out);
         }

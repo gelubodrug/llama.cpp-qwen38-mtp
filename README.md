@@ -1,10 +1,24 @@
-# llama.cpp + MTP Experimental — Qwen3.8 Flash Next
+# llama.cpp + MTP - locally patched Qwen3.8 Flash Next
 
-> Experimental Apple Silicon build of upstream [PR #28243](https://github.com/ggml-org/llama.cpp/pull/28243). The PR is still under review and this fork is not an official llama.cpp release.
+Personal experimental fork based on [llama.cpp PR #28243](https://github.com/ggml-org/llama.cpp/pull/28243). This repository publishes the locally patched version we tested on an Apple M5 Max with 128 GB unified memory, not an official llama.cpp release.
 
-![Qwen3.8 Flash Next llama.cpp MTP benchmark](docs/benchmarks/qwen38-flash-next-mtp-apple-silicon.png)
+The patch distinguishes shared weights from a shared KV cache for MTP drafts. An equivalent production fix already exists in upstream PR commit [`d1a92352`](https://github.com/ggml-org/llama.cpp/pull/28243/commits/d1a92352cbd417fd840b4e765c0b82f5fe3d1d89). We tested our local build, **not the author's updated build**, and do not claim a new upstream fix.
 
-On the same Qwen3.8 Flash Next `UD-IQ3_XXS` GGUF and the same deterministic prompt/settings, the MTP build measured **63.8 tok/s**, versus **44.4 tok/s** without MTP — **43.7% faster** from the rounded headline results. See [the reproducible benchmark notes](QWEN38_MTP_BENCHMARK.md).
+## Q4 coding-agent audit observations - September 6, 2026
+
+Qwen3.8 Flash Next `UD-Q4_K_XL`, 128K context, CO_DE client, same entry-point audit prompt.
+
+| | Stock, MTP off | Our patched build, MTP on |
+| --- | ---: | ---: |
+| Task stopwatch | 8:52.40 | 4:47.08 |
+| UI median generation speed | 27.5 tok/s | 33.2 tok/s |
+| Requests | 17 | 10 |
+
+MTP configuration: shared `Q4_K_M` draft, 2 draft tokens. These are observed agent runs, not a controlled fixed-output benchmark: the tool-call paths and request counts differ. The task-time difference cannot be attributed exclusively to MTP.
+
+See [the patch, build/run instructions, regression test and limitations](QWEN38_MTP_CACHE_FIX.md). The CPU regression covers catch-up and rollback with two and three draft tokens and was checked to fail before the fix and pass after it. Development and testing were AI-assisted with Codex.
+
+The [earlier IQ3 microbenchmark](QWEN38_MTP_BENCHMARK.md) is retained as historical data and is not the Q4 audit above.
 
 ---
 
